@@ -1,0 +1,360 @@
+"""
+test_strategy.py — Tests for the Avellaneda-Stoikov strategy.
+
+Key checks:
+  * Reservation price formula with known inputs
+  * Half-spread formula with known inputs
+  * Quote prices match AS formulas (rounded to ticks)
+  * Inventory update on fill
+  * PnL accounting
+  * Actions returned (cancel + re-submit) when mid changes
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import pytest
+from lob_sim.events import Cancel, Side, SubmitLimit
+from lob_sim.orderbook import LOBBook
+from lob_sim.strategy import AvellanedaStoikov, FairValueAvellanedaStoikov
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def flat_book(mid: int = 1000, spread: int = 4) -> LOBBook:
+    """Create a book with one bid and one ask to establish a mid."""
+    book = LOBBook()
+    book.submit_limit(Side.BID, mid - spread // 2, 100, 1, 0.0)
+    book.submit_limit(Side.ASK, mid + spread // 2, 100, 2, 0.0)
+    return book
+
+
+# ── formula verification ──────────────────────────────────────────────────────
+
+class TestASFormulas:
+    """Verify exact AS formula values with known parameters."""
+
+    GAMMA = 0.1
+    SIGMA = 2.0
+    K = 1.5
+    T = 1000.0
+
+    def _strat(self, inventory: int = 0) -> AvellanedaStoikov:
+        s = AvellanedaStoikov(
+            gamma=self.GAMMA,
+            sigma=self.SIGMA,
+            k=self.K,
+            T=self.T,
+        )
+        s._t0 = 0.0
+        s.inventory = inventory
+        return s
+
+    def test_reservation_price_zero_inventory(self):
+        """With q=0, reservation price = mid."""
+        s = self._strat(inventory=0)
+        mid = 1000.0
+        r = s.reservation_price(mid, t=0.0)
+        assert r == pytest.approx(mid)
+
+    def test_reservation_price_positive_inventory(self):
+        """With q>0, reservation price < mid (positive skew downward)."""
+        s = self._strat(inventory=5)
+        mid = 1000.0
+        t = 0.0
+        tau = self.T - t
+        expected_r = mid - 5 * self.GAMMA * (self.SIGMA ** 2) * tau
+        assert s.reservation_price(mid, t) == pytest.approx(expected_r)
+
+    def test_reservation_price_negative_inventory(self):
+        """With q<0, reservation price > mid."""
+        s = self._strat(inventory=-3)
+        mid = 1000.0
+        r = s.reservation_price(mid, t=0.0)
+        assert r > mid
+
+    def test_half_spread_formula(self):
+        """δ = 0.5*γ*σ²*(T-t) + (1/γ)*ln(1+γ/k)"""
+        s = self._strat()
+        t = 0.0
+        tau = self.T - t
+        expected_term1 = 0.5 * self.GAMMA * (self.SIGMA ** 2) * tau
+        expected_term2 = (1 / self.GAMMA) * math.log(1 + self.GAMMA / self.K)
+        expected_delta = expected_term1 + expected_term2
+        assert s.half_spread(t) == pytest.approx(expected_delta)
+
+    def test_half_spread_decreases_toward_terminal(self):
+        """δ should decrease as t → T (tau → 0)."""
+        s = self._strat()
+        delta_early = s.half_spread(t=0.0)
+        delta_late = s.half_spread(t=self.T * 0.9)
+        assert delta_late < delta_early
+
+    def test_half_spread_floor_at_terminal(self):
+        """At t=T, τ=0, δ = (1/γ)*ln(1+γ/k) only."""
+        s = self._strat()
+        delta_terminal = s.half_spread(t=self.T)
+        expected = (1 / self.GAMMA) * math.log(1 + self.GAMMA / self.K)
+        assert delta_terminal == pytest.approx(expected)
+
+
+# ── quote computation ─────────────────────────────────────────────────────────
+
+class TestQuoteComputation:
+    GAMMA = 0.1
+    SIGMA = 2.0
+    K = 1.5
+    T = 1000.0
+
+    def _strat(self, **kwargs) -> AvellanedaStoikov:
+        defaults = dict(gamma=self.GAMMA, sigma=self.SIGMA, k=self.K, T=self.T)
+        defaults.update(kwargs)
+        s = AvellanedaStoikov(**defaults)
+        s._t0 = 0.0
+        return s
+
+    def test_bid_below_mid_ask_above_mid(self):
+        """With zero inventory, bid < mid < ask."""
+        book = flat_book(mid=1000, spread=4)
+        s = self._strat()
+        bid_t, ask_t = s.compute_quotes(book, ts=0.0)
+        mid = book.mid()
+        assert bid_t < mid
+        assert ask_t > mid
+
+    def test_quotes_symmetric_at_zero_inventory(self):
+        """With q=0, bid and ask should be equidistant from mid."""
+        book = flat_book(mid=1000, spread=4)
+        s = self._strat()
+        bid_t, ask_t = s.compute_quotes(book, ts=0.0)
+        mid = book.mid()
+        # Due to rounding, allow 1 tick difference
+        assert abs((mid - bid_t) - (ask_t - mid)) <= 1
+
+    def test_positive_inventory_skews_quotes_down(self):
+        """With long inventory, both quotes shift down vs zero-inventory."""
+        book = flat_book(mid=1000)
+        s_flat = self._strat()
+        s_long = self._strat()
+        s_long.inventory = 10
+
+        bid_flat, ask_flat = s_flat.compute_quotes(book, ts=0.0)
+        bid_long, ask_long = s_long.compute_quotes(book, ts=0.0)
+
+        assert bid_long <= bid_flat
+        assert ask_long <= ask_flat
+
+    def test_negative_inventory_skews_quotes_up(self):
+        """With short inventory, both quotes shift up."""
+        book = flat_book(mid=1000)
+        s_flat = self._strat()
+        s_short = self._strat()
+        s_short.inventory = -10
+
+        bid_flat, ask_flat = s_flat.compute_quotes(book, ts=0.0)
+        bid_short, ask_short = s_short.compute_quotes(book, ts=0.0)
+
+        assert bid_short >= bid_flat
+        assert ask_short >= ask_flat
+
+    def test_quotes_are_positive_ticks(self):
+        book = flat_book(mid=1000)
+        s = self._strat()
+        bid_t, ask_t = s.compute_quotes(book, ts=0.0)
+        assert bid_t >= 1
+        assert ask_t >= 1
+
+    def test_ask_strictly_above_bid(self):
+        book = flat_book(mid=1000)
+        s = self._strat(min_spread=1)
+        bid_t, ask_t = s.compute_quotes(book, ts=0.0)
+        assert ask_t > bid_t
+
+    def test_returns_none_on_empty_book(self):
+        book = LOBBook()   # no mid
+        s = self._strat()
+        bid_t, ask_t = s.compute_quotes(book, ts=0.0)
+        assert bid_t is None
+        assert ask_t is None
+
+
+# ── on_book_update actions ────────────────────────────────────────────────────
+
+class TestOnBookUpdate:
+    def test_first_update_submits_two_quotes(self):
+        book = flat_book(mid=1000)
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        actions = s.on_book_update(book, ts=0.0)
+        submits = [a for a in actions if isinstance(a, SubmitLimit)]
+        assert len(submits) == 2
+        sides = {a.side for a in submits}
+        assert sides == {Side.BID, Side.ASK}
+
+    def test_unchanged_mid_produces_no_actions(self):
+        book = flat_book(mid=1000)
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.on_book_update(book, ts=0.0)
+        # Simulate the strategy orders being actually in the book
+        # Force last_mid to match current mid so no requote is needed
+        actions2 = s.on_book_update(book, ts=0.001)   # tiny dt, no mid change
+        # Should not re-quote if nothing changed
+        # (bid/ask ticks unchanged, mid unchanged)
+        submits = [a for a in actions2 if isinstance(a, SubmitLimit)]
+        assert len(submits) == 0
+
+    def test_mid_change_triggers_requote(self):
+        """Moving the BBO should cause cancel + re-submit."""
+        book = flat_book(mid=1000)
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        actions1 = s.on_book_update(book, ts=0.0)
+        # Register our bid and ask as if they actually went into the book
+        for a in actions1:
+            if isinstance(a, SubmitLimit):
+                book.submit_limit(a.side, a.price_ticks, a.qty, a.order_id, 0.0)
+
+        # Move the mid by adding better quotes to the same book (+10 tick shift).
+        # cancel the old BBO first, then add new ones at mid=1010.
+        book.cancel(1, ts=0.5)  # remove original bid at 998
+        book.cancel(2, ts=0.5)  # remove original ask at 1002
+        book.submit_limit(Side.BID, 1008, 100, 999_001, 0.5)
+        book.submit_limit(Side.ASK, 1012, 100, 999_002, 0.5)
+
+        actions2 = s.on_book_update(book, ts=1.0)
+        cancels = [a for a in actions2 if isinstance(a, Cancel)]
+        submits = [a for a in actions2 if isinstance(a, SubmitLimit)]
+        assert len(cancels) == 2    # cancel old bid and ask
+        assert len(submits) == 2    # re-submit new bid and ask
+
+
+# ── fill accounting ───────────────────────────────────────────────────────────
+
+class TestFillAccounting:
+    def test_bid_fill_increases_inventory(self):
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100,
+                  qty=5, ts=1.0)
+        assert s.inventory == 5
+        assert s.cash == -500   # paid 100 * 5
+
+    def test_ask_fill_decreases_inventory(self):
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.inventory = 5
+        s.on_fill(order_id=1, side=Side.ASK, price_ticks=102,
+                  qty=5, ts=1.0)
+        assert s.inventory == 0
+        assert s.cash == 510    # received 102 * 5
+
+    def test_round_trip_pnl(self):
+        """Buy at 100, sell at 102 → PnL = 2 ticks per contract."""
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=1, ts=0.0)
+        s.on_fill(order_id=2, side=Side.ASK, price_ticks=102, qty=1, ts=1.0)
+        # inventory = 0, cash = 102 - 100 = 2
+        assert s.inventory == 0
+        assert s.cash == 2.0
+        assert s.pnl(mid_ticks=100.0) == 2.0
+
+    def test_pnl_includes_unrealized(self):
+        """PnL = cash + q * mid."""
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=3, ts=0.0)
+        # inventory = 3, cash = -300
+        # mid moves to 105 → unrealized = 3 * 105 = 315, pnl = 315 - 300 = 15
+        assert s.pnl(mid_ticks=105.0) == pytest.approx(15.0)
+
+
+# ── fair-value anchored variant ──────────────────────────────────────────────
+
+class TestFairValueStrategy:
+    # Params chosen so delta is small (~1 tick): quote centring is then
+    # visible directly in the bid/ask prices.
+    PARAMS = dict(gamma=0.001, sigma=0.05, k=1.5, T=100.0)
+
+    def test_base_class_fair_value_is_mid(self):
+        book = flat_book(mid=1000, spread=4)
+        s = AvellanedaStoikov(**self.PARAMS)
+        assert s.fair_value(book) == book.mid()
+
+    def test_ewma_seeds_with_first_mid(self):
+        book = flat_book(mid=1000, spread=4)
+        s = FairValueAvellanedaStoikov(alpha=0.005, **self.PARAMS)
+        assert s.fair_value(book) == 1000.0
+
+    def test_ewma_lags_step_jump(self):
+        """After one update at mid=1000 and one at mid=1050:
+        fair = (1-a)*1000 + a*1050."""
+        alpha = 0.02
+        s = FairValueAvellanedaStoikov(alpha=alpha, **self.PARAMS)
+        s.fair_value(flat_book(mid=1000, spread=4))
+        fair = s.fair_value(flat_book(mid=1050, spread=4))
+        assert fair == pytest.approx((1 - alpha) * 1000.0 + alpha * 1050.0)
+
+    def test_ewma_converges_to_constant_mid(self):
+        book = flat_book(mid=1000, spread=4)
+        s = FairValueAvellanedaStoikov(alpha=0.1, **self.PARAMS)
+        for _ in range(50):
+            fair = s.fair_value(book)
+        assert fair == pytest.approx(1000.0)
+
+    def test_fair_value_carried_when_book_empties(self):
+        s = FairValueAvellanedaStoikov(alpha=0.005, **self.PARAMS)
+        s.fair_value(flat_book(mid=1000, spread=4))
+        assert s.fair_value(LOBBook()) == pytest.approx(1000.0)
+
+    def test_quotes_anchor_to_fair_not_mid(self):
+        """After a 50-tick mid jump, quotes must stay near the (lagging)
+        EWMA rather than re-centring on the new mid — the whole point of
+        the variant.  The base class re-centres immediately."""
+        s = FairValueAvellanedaStoikov(alpha=0.005, **self.PARAMS)
+        s._t0 = 0.0
+        s.fair_value(flat_book(mid=1000, spread=4))   # seed EWMA at 1000
+        jumped = flat_book(mid=1050, spread=4)
+
+        bid_fv, ask_fv = s.compute_quotes(jumped, ts=0.0)
+        # fair ≈ 1000.25; delta ≈ 1 tick → quotes within a few ticks of 1000
+        assert 995 <= bid_fv <= 1000
+        assert 1001 <= ask_fv <= 1005
+
+        base = AvellanedaStoikov(**self.PARAMS)
+        base._t0 = 0.0
+        bid_as, _ = base.compute_quotes(jumped, ts=0.0)
+        assert bid_as >= 1045   # base class chases the new mid
+
+    def test_reset_clears_fair_value(self):
+        s = FairValueAvellanedaStoikov(alpha=0.005, **self.PARAMS)
+        s.fair_value(flat_book(mid=1000, spread=4))
+        s.reset(ts=0.0)
+        assert s._fair is None
+
+
+# ── reset ────────────────────────────────────────────────────────────────────
+
+class TestReset:
+    def test_reset_restarts_id_counter(self):
+        """IDs restart at the range base after reset() so long-running
+        processes never drift the strategy range."""
+        from lob_sim.strategy import STRATEGY_ID_BASE
+        book = flat_book(mid=1000)
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        first_ids = sorted(a.order_id for a in s.on_book_update(book, ts=0.0)
+                           if isinstance(a, SubmitLimit))
+        s.reset(ts=0.0)
+        second_ids = sorted(a.order_id for a in s.on_book_update(book, ts=0.0)
+                            if isinstance(a, SubmitLimit))
+        assert first_ids == second_ids
+        assert first_ids[0] == STRATEGY_ID_BASE
+
+    def test_reset_clears_state(self):
+        s = AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0)
+        s.inventory = 10
+        s.cash = -1000.0
+        s._bid_id = 99
+        s.reset(ts=0.0)
+        assert s.inventory == 0
+        assert s.cash == 0.0
+        assert s._bid_id is None
