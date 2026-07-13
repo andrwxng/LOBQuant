@@ -29,7 +29,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from lob_sim import PoissonFlow, Simulator, metrics
-from lob_sim.strategy import AvellanedaStoikov, FairValueAvellanedaStoikov
+from lob_sim.strategy import (
+    AvellanedaStoikov, FairValueAvellanedaStoikov,
+    ImbalanceFairValueAvellanedaStoikov,
+)
 
 # Flow / strategy config mirrors the original README sweep so the tables
 # stay comparable
@@ -52,6 +55,16 @@ FV_GAMMAS = [0.002, 0.005, 0.01]
 # Fill-intensity decay measured by scripts/calibrate_k.py (independent of
 # any PnL tuning; see README).  The strategy default assumes k=1.5.
 K_CALIBRATED = 0.213
+
+# Realistic maker-taker venue economics, in ticks per contract
+MAKER_REBATE = -0.3
+TAKER_FEE = 1.0
+
+# Imbalance mode: β grid searched on train seeds on top of the fv-selected
+# configuration (γ=0.01, α=0.005, calibrated k)
+IMB_BETAS = [0.5, 1.0, 2.0, 4.0]
+IMB_BASE = dict(alpha=0.005, k=K_CALIBRATED)
+IMB_GAMMA = 0.01
 
 
 def run_one(
@@ -152,12 +165,18 @@ def sweep_fv() -> None:
     val_fv_k = _row([run_one(gamma, seed, FairValueAvellanedaStoikov,
                              alpha=alpha, k=K_CALIBRATED)
                      for seed in VALIDATE_SEEDS])
+    val_fv_fees = _row([run_one(gamma, seed, FairValueAvellanedaStoikov,
+                                alpha=alpha, k=K_CALIBRATED,
+                                maker_fee=MAKER_REBATE, taker_fee=TAKER_FEE)
+                        for seed in VALIDATE_SEEDS])
 
     print("| Strategy | Mean PnL | PnL std | Sharpe | Max DD | Inv std | Fill rate | Adv sel |")
     print("|----------|----------|---------|--------|--------|---------|-----------|---------|")
     for label, r in ((f"AS baseline (γ={gamma:g})", val_as),
                      (f"Fair-value AS (γ={gamma:g}, α={alpha:g})", val_fv),
-                     (f"Fair-value AS + calibrated k={K_CALIBRATED}", val_fv_k)):
+                     (f"Fair-value AS + calibrated k={K_CALIBRATED}", val_fv_k),
+                     (f"… + maker rebate {-MAKER_REBATE:g}, taker fee {TAKER_FEE:g}",
+                      val_fv_fees)):
         print(f"| {label} | {r['pnl_mean']:+,.0f} | {r['pnl_std']:,.0f} "
               f"| {r['sharpe']:.2f} | {r['max_dd']:,.0f} | {r['inv_std']:.2f} "
               f"| {r['fill_rate']:.1%} | {r['adv_sel']:+.2f} |")
@@ -180,16 +199,64 @@ def sweep_fv() -> None:
     print(f"\ndone in {time.time() - t_start:.1f}s")
 
 
+def sweep_imb() -> None:
+    """β grid for the imbalance skew, layered on the fv-selected config."""
+    t_start = time.time()
+    print(f"Imbalance β search on TRAIN seeds (base: γ={IMB_GAMMA:g}, "
+          f"α={IMB_BASE['alpha']:g}, k={IMB_BASE['k']:g})\n")
+
+    # β=0 benchmark is the plain fair-value strategy with the same base
+    bench = [run_one(IMB_GAMMA, seed, FairValueAvellanedaStoikov, **IMB_BASE)
+             ['final_pnl_ticks'] for seed in TRAIN_SEEDS]
+    print(f"  β=0 (benchmark)  pnl={_mean(bench):>7.0f}±{_std(bench):<7.0f}")
+
+    best = dict(beta=0.0, score=_mean(bench) / _std(bench))
+    for beta in IMB_BETAS:
+        pnls = [run_one(IMB_GAMMA, seed, ImbalanceFairValueAvellanedaStoikov,
+                        beta=beta, **IMB_BASE)['final_pnl_ticks']
+                for seed in TRAIN_SEEDS]
+        mean, std = _mean(pnls), _std(pnls)
+        score = mean / std if std and std > 0 else float('-inf')
+        print(f"  β={beta:<6g}         pnl={mean:>7.0f}±{std:<7.0f}"
+              f" score={score:>6.2f}")
+        if score > best['score']:
+            best = dict(beta=beta, score=score)
+
+    print(f"\nSelected on train seeds: β={best['beta']:g}")
+    print(f"\nValidation (held-out seeds "
+          f"{VALIDATE_SEEDS[0]}-{VALIDATE_SEEDS[-1]}):\n")
+    val_fv = _row([run_one(IMB_GAMMA, seed, FairValueAvellanedaStoikov,
+                           **IMB_BASE) for seed in VALIDATE_SEEDS])
+    rows = [("Fair-value AS (β=0)", val_fv)]
+    if best['beta'] > 0:
+        val_imb = _row([run_one(IMB_GAMMA, seed,
+                                ImbalanceFairValueAvellanedaStoikov,
+                                beta=best['beta'], **IMB_BASE)
+                        for seed in VALIDATE_SEEDS])
+        rows.append((f"+ imbalance skew (β={best['beta']:g})", val_imb))
+
+    print("| Strategy | Mean PnL | PnL std | Max DD | Fill rate | Adv sel |")
+    print("|----------|----------|---------|--------|-----------|---------|")
+    for label, r in rows:
+        print(f"| {label} | {r['pnl_mean']:+,.0f} | {r['pnl_std']:,.0f} "
+              f"| {r['max_dd']:,.0f} | {r['fill_rate']:.1%} "
+              f"| {r['adv_sel']:+.2f} |")
+    print(f"\ndone in {time.time() - t_start:.1f}s")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--strategy', choices=['as', 'fv'], default='as',
+    parser.add_argument('--strategy', choices=['as', 'fv', 'imb'], default='as',
                         help="'as' = baseline γ-sweep, 'fv' = fair-value "
-                             "grid search + held-out validation")
+                             "grid search + held-out validation, 'imb' = "
+                             "imbalance-skew β search on the fv config")
     args = parser.parse_args()
     if args.strategy == 'as':
         sweep_as()
-    else:
+    elif args.strategy == 'fv':
         sweep_fv()
+    else:
+        sweep_imb()
 
 
 if __name__ == "__main__":

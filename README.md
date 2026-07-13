@@ -12,7 +12,7 @@ lob_sim/
   events.py        dataclasses: Order, MarketOrder, CancelRequest, Trade, BookSnapshot, Action types
   orderbook.py     matching engine (LOBBook)
   flow.py          synthetic flow generators: PoissonFlow, LOBSTERReplay
-  strategy.py      Strategy ABC + AvellanedaStoikov + FairValueAvellanedaStoikov
+  strategy.py      Strategy ABC + AvellanedaStoikov + fair-value/imbalance variants
   simulator.py     event-driven loop + run_simulation() factory
   metrics.py       PnL, Sharpe, drawdown, fill rate, adverse selection, inventory profile
 tests/
@@ -213,6 +213,7 @@ validation seeds 13–24**:
 | AS baseline (γ=0.01) | −188 | 46 | 209 | 7.5% | +1.57 |
 | Fair-value AS (γ=0.01, α=0.005) | **+419** | 52 | 31 | 8.3% | +1.20 |
 | Fair-value AS + calibrated k=0.213 | **+768** | 94 | 22 | 8.7% | +1.18 |
+| … + maker rebate 0.3 / taker fee 1.0 | **+825** | 102 | 23 | 8.7% | +1.18 |
 
 The third row uses the fill-intensity decay measured by
 `python scripts/calibrate_k.py`: pooled over instrumented runs, realized
@@ -221,6 +222,32 @@ probability decays ~7× more slowly with depth than the model assumed, so
 wider quotes cost far less fill rate than the formula believes. Since k̂ is
 measured from fill/exposure data (not tuned on PnL), feeding it back is
 calibration, not curve-fitting.
+
+The fourth row applies maker-taker venue economics (`maker_fee=-0.3`,
+`taker_fee=1.0` ticks/contract on the strategy): because ~99% of fills are
+passive, the rebate dominates and adds ~+57/hr. Fee-aware accounting also
+reframes the *baseline* result — naive AS at γ=0.0005 loses only ~0.31
+ticks/fill, so on a rebate venue it would sit near breakeven even without
+the fair-value anchor.
+
+### Order-book imbalance skew
+
+`ImbalanceFairValueAvellanedaStoikov` additionally shifts the anchor by
+top-3-level queue imbalance, `fair += β·(Qb−Qa)/(Qb+Qa)` — a one-sided book
+predicts short-horizon drift toward the thin side. β selected on training
+seeds (β=2), reported on validation seeds
+(`python scripts/gamma_sweep.py --strategy imb`):
+
+| Strategy | Mean PnL | PnL std | Max DD |
+|----------|----------|---------|--------|
+| Fair-value AS (β=0) | +768 | 94 | 22 |
+| + imbalance skew (β=2) | **+892** | 94 | 23 |
+
+One caveat: the imbalance signal jitters, so the strategy requotes far more
+often (fill rate per submitted quote drops from 8.7% to 1.4%). Message
+traffic is free in this simulator but is a real cost on actual venues
+(order-to-trade ratios, rate limits) — a production version would debounce
+the signal.
 
 ### Robustness (selected cell, validation seeds, perturbed flow)
 
@@ -249,7 +276,7 @@ without recalibration.
 This simulation uses no future information: the strategy observes only the current book state and elapsed time. However, the flow parameters (λ_lim, λ_mkt, k) are assumed constant across the session. In live markets these parameters are non-stationary (intraday seasonality, regime changes). Calibrating on in-sample data and backtesting on out-of-sample data is essential before drawing conclusions about edge.
 
 ### Transaction cost assumptions
-The simulator assumes zero fees. In practice, maker-taker fee schedules on electronic venues charge the market-order aggressor and rebate the passive poster (or charge both at different rates). The optimal spread δ must cover fees: at minimum, `δ > fee_per_side`. Adding a fee parameter to `AvellanedaStoikov` and flooring quotes accordingly is straightforward but left to the user.
+Fees default to zero but are modeled: `AvellanedaStoikov(maker_fee=…, taker_fee=…)` charges (or rebates, if negative) ticks per contract on each fill, with the simulator distinguishing passive from aggressor executions. The results section reports a maker-rebate scenario. The quoting formulas do not yet incorporate fees into δ itself (i.e., quotes are not fee-floored) — that refinement is left as future work.
 
 ### Adverse selection
 The simulator models adverse selection implicitly through the Poisson fill intensity: informed traders arriving as market orders move the mid against the market maker after the fill. The `metrics.adverse_selection()` function measures the average mid-price change in the 1-second horizon after each fill (signed so that positive = adverse). In a real venue, adverse selection is substantially larger than in this model because (a) informed traders use limit orders as well, (b) latency allows other participants to update quotes faster than our model assumes, and (c) correlated order flow creates burst-fill episodes. The AS model's `k` parameter partially captures fill-intensity effects but does not model queue dynamics or latency explicitly.

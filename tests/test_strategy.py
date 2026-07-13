@@ -21,7 +21,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 from lob_sim.events import Cancel, Side, SubmitLimit
 from lob_sim.orderbook import LOBBook
-from lob_sim.strategy import AvellanedaStoikov, FairValueAvellanedaStoikov
+from lob_sim.strategy import (
+    AvellanedaStoikov, FairValueAvellanedaStoikov,
+    ImbalanceFairValueAvellanedaStoikov,
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -266,6 +269,70 @@ class TestFillAccounting:
         # inventory = 3, cash = -300
         # mid moves to 105 → unrealized = 3 * 105 = 315, pnl = 315 - 300 = 15
         assert s.pnl(mid_ticks=105.0) == pytest.approx(15.0)
+
+
+# ── fee accounting ───────────────────────────────────────────────────────────
+
+class TestFees:
+    def _strat(self, **kw):
+        return AvellanedaStoikov(gamma=0.1, sigma=2.0, k=1.5, T=1000.0, **kw)
+
+    def test_maker_rebate_credits_cash(self):
+        s = self._strat(maker_fee=-0.3)   # rebate
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=5,
+                  ts=0.0, maker=True)
+        assert s.cash == pytest.approx(-500 + 0.3 * 5)
+
+    def test_taker_fee_debits_cash(self):
+        s = self._strat(taker_fee=1.0)
+        s.on_fill(order_id=1, side=Side.ASK, price_ticks=100, qty=2,
+                  ts=0.0, maker=False)
+        assert s.cash == pytest.approx(200 - 1.0 * 2)
+
+    def test_maker_fee_not_applied_to_taker_fill(self):
+        s = self._strat(maker_fee=-0.3, taker_fee=1.0)
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=1,
+                  ts=0.0, maker=False)
+        assert s.cash == pytest.approx(-100 - 1.0)
+
+    def test_zero_fees_preserve_old_accounting(self):
+        s = self._strat()
+        s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=5, ts=0.0)
+        assert s.cash == -500
+
+
+# ── imbalance-adjusted fair value ────────────────────────────────────────────
+
+class TestImbalanceFairValue:
+    PARAMS = dict(gamma=0.001, sigma=0.05, k=1.5, T=100.0)
+
+    def test_balanced_book_no_adjustment(self):
+        book = flat_book(mid=1000, spread=4)   # 100 qty on each side
+        s = ImbalanceFairValueAvellanedaStoikov(beta=2.0, **self.PARAMS)
+        assert s.fair_value(book) == pytest.approx(1000.0)
+
+    def test_heavy_bid_side_shifts_fair_up(self):
+        book = LOBBook()
+        book.submit_limit(Side.BID, 998, 300, 1, 0.0)   # heavy bid
+        book.submit_limit(Side.ASK, 1002, 100, 2, 0.0)
+        s = ImbalanceFairValueAvellanedaStoikov(beta=2.0, **self.PARAMS)
+        # imbalance = (300-100)/400 = 0.5 → fair = 1000 + 2.0*0.5
+        assert s.fair_value(book) == pytest.approx(1001.0)
+
+    def test_heavy_ask_side_shifts_fair_down(self):
+        book = LOBBook()
+        book.submit_limit(Side.BID, 998, 100, 1, 0.0)
+        book.submit_limit(Side.ASK, 1002, 300, 2, 0.0)   # heavy ask
+        s = ImbalanceFairValueAvellanedaStoikov(beta=2.0, **self.PARAMS)
+        assert s.fair_value(book) == pytest.approx(999.0)
+
+    def test_adjustment_does_not_pollute_ewma_state(self):
+        book = LOBBook()
+        book.submit_limit(Side.BID, 998, 300, 1, 0.0)
+        book.submit_limit(Side.ASK, 1002, 100, 2, 0.0)
+        s = ImbalanceFairValueAvellanedaStoikov(beta=2.0, **self.PARAMS)
+        s.fair_value(book)
+        assert s._fair == pytest.approx(1000.0)   # EWMA holds the raw mid
 
 
 # ── fair-value anchored variant ──────────────────────────────────────────────

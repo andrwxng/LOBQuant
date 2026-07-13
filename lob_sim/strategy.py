@@ -72,8 +72,13 @@ class Strategy(ABC):
         price_ticks: int,
         qty: int,
         ts: float,
+        maker: bool = True,
     ) -> None:
-        """Called when one of our resting orders is (partially) filled."""
+        """
+        Called when one of our orders is (partially) filled.
+        maker=True: our resting quote was hit (passive fill).
+        maker=False: our order crossed the spread and executed as aggressor.
+        """
         ...
 
     @abstractmethod
@@ -98,6 +103,10 @@ class AvellanedaStoikov(Strategy):
     min_spread  : minimum half-spread in ticks (floor; prevents quotes crossing)
     max_inventory : hard inventory limit; quotes skewed off when breached
     tick_size   : tick size in price units (for rounding)
+    maker_fee   : fee in ticks per contract charged on passive fills
+                  (negative = rebate, as on maker-taker venues)
+    taker_fee   : fee in ticks per contract charged when our order crosses
+                  the spread and executes as aggressor
     """
 
     def __init__(
@@ -111,6 +120,8 @@ class AvellanedaStoikov(Strategy):
         max_half_spread: int = 50,
         max_inventory: int = 50,
         tick_size: int = 1,
+        maker_fee: float = 0.0,
+        taker_fee: float = 0.0,
     ) -> None:
         # max_half_spread caps δ to prevent quotes from wandering far outside
         # the seeded book when T-t is large.  Without this, the AS formula
@@ -126,6 +137,8 @@ class AvellanedaStoikov(Strategy):
         self.min_spread = min_spread
         self.max_inventory = max_inventory
         self.tick_size = tick_size
+        self.maker_fee = maker_fee
+        self.taker_fee = taker_fee
 
         # State
         self._id_counter = itertools.count(STRATEGY_ID_BASE)
@@ -289,6 +302,7 @@ class AvellanedaStoikov(Strategy):
         price_ticks: int,
         qty: int,
         ts: float,
+        maker: bool = True,
     ) -> None:
         """Update inventory and cash on fill."""
         if side == Side.BID:
@@ -299,6 +313,8 @@ class AvellanedaStoikov(Strategy):
             # We sold qty contracts at price_ticks
             self.inventory -= qty
             self.cash += price_ticks * qty
+
+        self.cash -= (self.maker_fee if maker else self.taker_fee) * qty
 
         # The _our_orders entry is kept even after a fill: a partially filled
         # quote still rests in the book and later fills on it must still be
@@ -384,3 +400,37 @@ class FairValueAvellanedaStoikov(AvellanedaStoikov):
     def reset(self, ts: float = 0.0) -> None:
         super().reset(ts)
         self._fair = None
+
+
+class ImbalanceFairValueAvellanedaStoikov(FairValueAvellanedaStoikov):
+    """
+    Fair-value variant that additionally skews the anchor by top-of-book
+    imbalance:
+
+        fair' = EWMA(mid) + beta * (Qb - Qa) / (Qb + Qa)
+
+    where Qb/Qa are total quantities on the top *imbalance_depth* levels of
+    each side.  Rationale: a one-sided book (e.g. asks depleted by a sweep)
+    means the next market order moves the price further in that direction,
+    so expected short-horizon drift points toward the thin side.
+
+    The adjustment is applied to the returned value only — it does not feed
+    back into the EWMA state.
+    """
+
+    def __init__(self, beta: float = 1.0, imbalance_depth: int = 3,
+                 **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.beta = beta
+        self.imbalance_depth = imbalance_depth
+
+    def fair_value(self, book: LOBBook) -> Optional[float]:
+        fair = super().fair_value(book)
+        if fair is None:
+            return None
+        snap = book.snapshot(depth=self.imbalance_depth)
+        qb = sum(q for _, q in snap.bids)
+        qa = sum(q for _, q in snap.asks)
+        if qb + qa > 0:
+            fair += self.beta * (qb - qa) / (qb + qa)
+        return fair

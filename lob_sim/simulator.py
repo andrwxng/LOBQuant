@@ -194,6 +194,7 @@ class Simulator:
                             price_ticks=trade.price_ticks,
                             qty=trade.qty,
                             ts=current_ts,
+                            maker=True,
                         )
                     # A strategy quote priced through the BBO executes as the
                     # aggressor; those fills must be accounted too.
@@ -204,6 +205,7 @@ class Simulator:
                             price_ticks=trade.price_ticks,
                             qty=trade.qty,
                             ts=current_ts,
+                            maker=False,
                         )
 
             # ── Notify strategy ───────────────────────────────────────────
