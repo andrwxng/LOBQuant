@@ -10,7 +10,8 @@ from .orderbook import LOBBook
 from .flow import LOBSTERReplay, OrderFlowGenerator, PoissonFlow
 from .strategy import (
     AvellanedaStoikov, FairValueAvellanedaStoikov,
-    ImbalanceFairValueAvellanedaStoikov, Strategy,
+    ImbalanceFairValueAvellanedaStoikov,
+    QueueAwareFairValueAvellanedaStoikov, Strategy,
 )
 from .simulator import SimulationResult, Simulator, run_simulation
 from . import metrics
@@ -25,7 +26,8 @@ __all__ = [
     "LOBSTERReplay", "OrderFlowGenerator", "PoissonFlow",
     # strategy
     "AvellanedaStoikov", "FairValueAvellanedaStoikov",
-    "ImbalanceFairValueAvellanedaStoikov", "Strategy",
+    "ImbalanceFairValueAvellanedaStoikov",
+    "QueueAwareFairValueAvellanedaStoikov", "Strategy",
     # simulator
     "SimulationResult", "Simulator", "run_simulation",
     # analytics

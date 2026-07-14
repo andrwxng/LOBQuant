@@ -22,9 +22,11 @@ tests/
   test_simulator.py
   test_metrics.py
 scripts/
-  gamma_sweep.py   reproducible sweeps (source of every results table below)
-  calibrate_k.py   empirical fill-intensity decay calibration
-  benchmark.py     engine throughput measurement
+  gamma_sweep.py     reproducible sweeps (source of every results table below)
+  calibrate_k.py     empirical fill-intensity decay calibration
+  queue_analysis.py  fill probability vs FIFO queue position
+  latency_sweep.py   PnL vs order-entry latency
+  benchmark.py       engine throughput measurement
 notebooks/
   01_engine_sanity.ipynb
   02_flow_calibration.ipynb
@@ -249,6 +251,61 @@ traffic is free in this simulator but is a real cost on actual venues
 (order-to-trade ratios, rate limits) — a production version would debounce
 the signal.
 
+### Queue position
+
+`LOBBook.queue_position(order_id)` exposes (orders ahead, qty ahead) in the
+FIFO queue.  Measuring fill probability against queue position at first
+sighting (`python scripts/queue_analysis.py`) gives the monotone curve that
+Cont & de Larrard (2013) model:
+
+| qty ahead in queue | quotes | fill probability |
+|--------------------|--------|------------------|
+| 0 | 19,227 | 9.1% |
+| 1–2 | 3,040 | 5.8% |
+| 3–5 | 3,380 | 4.1% |
+| 6–10 | 1,352 | 3.5% |
+| 11+ | 144 | 2.8% |
+
+Cancel-replace sends an order to the back of this curve, which motivates
+`QueueAwareFairValueAvellanedaStoikov`: requote each side independently and
+only when its desired price moved by more than `queue_patience` ticks.
+Selected on training seeds (patience=0 — i.e. pure per-side requoting),
+reported on validation seeds (`python scripts/gamma_sweep.py --strategy queue`):
+
+| Strategy | Mean PnL | PnL std | Max DD | Fill rate | Adv sel |
+|----------|----------|---------|--------|-----------|---------|
+| Fair-value AS (both-side requote) | +768 | 94 | 22 | 8.7% | +1.18 |
+| Queue-aware (patience=0) | **+1,141** | 79 | 34 | 8.6% | +1.15 |
+
+The entire +49% gain comes from *not* cancelling the side whose price didn't
+move: the base requote logic forfeits FIFO seniority on both sides whenever
+either changes.  Larger patience raises mean PnL further on training seeds
+but with proportionally more variance; the selection rule (mean/std) prefers
+patience=0.
+
+### Latency
+
+`Simulator(latency=…)` delays every strategy submission and cancellation by
+a fixed interval (order-entry latency; market-data latency is not modeled).
+Strategy state stays consistent under in-flight fills and cancels — orders
+are tracked until confirmed gone, and superseded in-flight quotes are
+garbage-collected once they land.  PnL on validation seeds
+(`python scripts/latency_sweep.py`):
+
+| Latency | Fair-value AS | Queue-aware (patience=0) |
+|---------|---------------|--------------------------|
+| 0 ms | +768 ± 94 | +1,141 ± 79 |
+| 50 ms | +710 ± 48 | +1,126 ± 132 |
+| 200 ms | +682 ± 119 | +864 ± 122 |
+| 1 s | +622 ± 74 | +455 ± 168 |
+
+Two observations. First, the edge decays with latency for both variants, as
+it must.  Second, the ranking *inverts* around the mean inter-event time
+(~170 ms): queue-aware quoting acts on finer-grained signals, which is an
+advantage when orders land promptly and a liability when every decision is
+a second stale — at 1 s the simpler both-side strategy wins.  Speed and
+signal granularity are complements, not independent choices.
+
 ### Robustness (selected cell, validation seeds, perturbed flow)
 
 | Flow regime | Mean PnL | PnL std |
@@ -276,7 +333,7 @@ without recalibration.
 This simulation uses no future information: the strategy observes only the current book state and elapsed time. However, the flow parameters (λ_lim, λ_mkt, k) are assumed constant across the session. In live markets these parameters are non-stationary (intraday seasonality, regime changes). Calibrating on in-sample data and backtesting on out-of-sample data is essential before drawing conclusions about edge.
 
 ### Transaction cost assumptions
-Fees default to zero but are modeled: `AvellanedaStoikov(maker_fee=…, taker_fee=…)` charges (or rebates, if negative) ticks per contract on each fill, with the simulator distinguishing passive from aggressor executions. The results section reports a maker-rebate scenario. The quoting formulas do not yet incorporate fees into δ itself (i.e., quotes are not fee-floored) — that refinement is left as future work.
+Fees default to zero but are modeled: `AvellanedaStoikov(maker_fee=…, taker_fee=…)` charges (or rebates, if negative) ticks per contract on each fill, with the simulator distinguishing passive from aggressor executions. The results section reports a maker-rebate scenario. Quotes are fee-floored: the half-spread δ never drops below the per-side maker fee, so a round trip cannot lock in a sub-fee spread.
 
 ### Adverse selection
 The simulator models adverse selection implicitly through the Poisson fill intensity: informed traders arriving as market orders move the mid against the market maker after the fill. The `metrics.adverse_selection()` function measures the average mid-price change in the 1-second horizon after each fill (signed so that positive = adverse). In a real venue, adverse selection is substantially larger than in this model because (a) informed traders use limit orders as well, (b) latency allows other participants to update quotes faster than our model assumes, and (c) correlated order flow creates burst-fill episodes. The AS model's `k` parameter partially captures fill-intensity effects but does not model queue dynamics or latency explicitly.
@@ -285,8 +342,7 @@ The simulator models adverse selection implicitly through the Poisson fill inten
 
 ## Future work
 
-- **Queue position modeling**: Track FIFO position within each price level and estimate fill probability as a function of queue depth, as in Cont & de Larrard (2013).
-- **Latency modeling**: Add configurable network + processing latency to all order submissions and cancellations.
+- **Market-data latency**: The simulator models order-entry latency; a stale *view* of the book (data latency) is a separate and larger effect.
 - **Multi-asset / correlation**: Extend to pairs trading or ETF arbitrage strategies.
 - **Hidden / iceberg orders**: Add a `hidden_qty` field to `Order` for hidden reserve.
 - **Auction phases**: Opening and closing auction mechanics (batch matching).

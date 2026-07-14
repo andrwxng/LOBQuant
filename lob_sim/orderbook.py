@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from sortedcontainers import SortedDict
 
@@ -273,6 +273,31 @@ class LOBBook:
         """Return remaining qty for a resting order, or None if not found."""
         rec = self._orders.get(order_id)
         return rec.qty if rec is not None else None
+
+    def queue_position(self, order_id: int) -> Optional[Tuple[int, int]]:
+        """
+        Return (orders_ahead, qty_ahead) for a resting order — how many
+        orders and how much quantity sit in front of it in the FIFO queue
+        at its price level.  (0, 0) means it is next to be filled at that
+        level.  None if the order is not resting.  O(level size).
+        """
+        rec = self._orders.get(order_id)
+        if rec is None:
+            return None
+        if rec.side == Side.BID:
+            level = self._bids.get(-rec.price_ticks)
+        else:
+            level = self._asks.get(rec.price_ticks)
+        if level is None:
+            return None
+        orders_ahead = 0
+        qty_ahead = 0
+        for oid, qty in level:
+            if oid == order_id:
+                return orders_ahead, qty_ahead
+            orders_ahead += 1
+            qty_ahead += qty
+        return None
 
     def has_order(self, order_id: int) -> bool:
         return order_id in self._orders

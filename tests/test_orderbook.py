@@ -342,6 +342,40 @@ class TestInvariants:
         book._assert_invariants()
 
 
+# ── queue position ────────────────────────────────────────────────────────────
+
+class TestQueuePosition:
+    def test_first_in_queue(self):
+        book = make_book()
+        bid(book, 100, 5, oid=1)
+        assert book.queue_position(1) == (0, 0)
+
+    def test_position_behind_earlier_orders(self):
+        book = make_book()
+        bid(book, 100, 5, oid=1)
+        bid(book, 100, 7, oid=2)
+        bid(book, 100, 3, oid=3)
+        assert book.queue_position(3) == (2, 12)   # behind 5 + 7
+
+    def test_position_advances_on_front_fill(self):
+        book = make_book()
+        ask(book, 100, 5, oid=1)
+        ask(book, 100, 3, oid=2)
+        market_buy(book, 5, oid=99)    # consumes order 1 entirely
+        assert book.queue_position(2) == (0, 0)
+
+    def test_position_advances_on_cancel_ahead(self):
+        book = make_book()
+        bid(book, 100, 5, oid=1)
+        bid(book, 100, 3, oid=2)
+        book.cancel(1, ts=1.0)
+        assert book.queue_position(2) == (0, 0)
+
+    def test_nonexistent_order_returns_none(self):
+        book = make_book()
+        assert book.queue_position(42) is None
+
+
 # ── snapshot ──────────────────────────────────────────────────────────────────
 
 class TestSnapshot:

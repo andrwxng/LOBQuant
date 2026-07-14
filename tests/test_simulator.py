@@ -144,6 +144,58 @@ class TestNoRequoteFeedbackLoop:
         assert len(result.pnl_ts) < 20_000
 
 
+class TestLatency:
+    def _config(self, seed, latency):
+        flow = PoissonFlow(seed=seed, lambda_lim=5.0, lambda_mkt=0.3,
+                           lambda_cancel=0.3, max_qty=3)
+        strat = FairValueAvellanedaStoikov(
+            alpha=0.005, gamma=0.01, sigma=0.86, k=1.5, T=600.0,
+            max_inventory=30, max_half_spread=8)
+        sim = Simulator(flow=flow, strategy=strat, duration=600.0,
+                        snapshot_interval=0.0, initial_depth=20,
+                        initial_qty_per_level=5, latency=latency)
+        return sim, strat
+
+    def test_zero_latency_matches_default(self):
+        sim_a, _ = self._config(seed=5, latency=0.0)
+        r_a = sim_a.run()
+        flow = PoissonFlow(seed=5, lambda_lim=5.0, lambda_mkt=0.3,
+                           lambda_cancel=0.3, max_qty=3)
+        strat = FairValueAvellanedaStoikov(
+            alpha=0.005, gamma=0.01, sigma=0.86, k=1.5, T=600.0,
+            max_inventory=30, max_half_spread=8)
+        sim_b = Simulator(flow=flow, strategy=strat, duration=600.0,
+                          snapshot_interval=0.0, initial_depth=20,
+                          initial_qty_per_level=5)   # latency omitted
+        r_b = sim_b.run()
+        assert r_a.final_pnl == r_b.final_pnl
+        assert len(r_a.trades) == len(r_b.trades)
+
+    def test_accounting_consistent_under_latency(self):
+        """Fills landing while cancels are in flight must still be accounted:
+        strategy state must exactly match a trade-log reconstruction."""
+        sim, strat = self._config(seed=7, latency=0.5)
+        result = sim.run()
+        inv, cash = 0, 0.0
+        for t in result.trades:
+            if t.passive_order_id in strat.all_submitted_ids:
+                if t.aggressor_side.value == 'ask':
+                    inv += t.qty
+                    cash -= t.price_ticks * t.qty
+                else:
+                    inv -= t.qty
+                    cash += t.price_ticks * t.qty
+            if t.aggressor_order_id >= STRATEGY_ID_MIN:
+                if t.aggressor_side.value == 'bid':
+                    inv += t.qty
+                    cash -= t.price_ticks * t.qty
+                else:
+                    inv -= t.qty
+                    cash += t.price_ticks * t.qty
+        assert strat.inventory == inv
+        assert strat.cash == cash
+
+
 class TestFairValueProfitability:
     def test_validated_config_is_profitable(self):
         """

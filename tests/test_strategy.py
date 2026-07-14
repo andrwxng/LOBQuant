@@ -24,6 +24,7 @@ from lob_sim.orderbook import LOBBook
 from lob_sim.strategy import (
     AvellanedaStoikov, FairValueAvellanedaStoikov,
     ImbalanceFairValueAvellanedaStoikov,
+    QueueAwareFairValueAvellanedaStoikov,
 )
 
 
@@ -300,6 +301,24 @@ class TestFees:
         s.on_fill(order_id=1, side=Side.BID, price_ticks=100, qty=5, ts=0.0)
         assert s.cash == -500
 
+    def test_fee_floor_widens_spread(self):
+        """With maker_fee=3, the half-spread is floored at 3 ticks so a
+        round trip can never lock in a sub-fee spread."""
+        s = AvellanedaStoikov(gamma=0.001, sigma=0.05, k=1.5, T=100.0,
+                              maker_fee=3.0)
+        s._t0 = 0.0
+        bid_t, ask_t = s.compute_quotes(flat_book(mid=1000, spread=4), ts=0.0)
+        assert bid_t <= 997
+        assert ask_t >= 1003
+
+    def test_rebate_does_not_tighten_floor(self):
+        s_fee = AvellanedaStoikov(gamma=0.001, sigma=0.05, k=1.5, T=100.0,
+                                  maker_fee=-0.5)
+        s_ref = AvellanedaStoikov(gamma=0.001, sigma=0.05, k=1.5, T=100.0)
+        s_fee._t0 = s_ref._t0 = 0.0
+        book = flat_book(mid=1000, spread=4)
+        assert s_fee.compute_quotes(book, 0.0) == s_ref.compute_quotes(book, 0.0)
+
 
 # ── imbalance-adjusted fair value ────────────────────────────────────────────
 
@@ -333,6 +352,86 @@ class TestImbalanceFairValue:
         s = ImbalanceFairValueAvellanedaStoikov(beta=2.0, **self.PARAMS)
         s.fair_value(book)
         assert s._fair == pytest.approx(1000.0)   # EWMA holds the raw mid
+
+
+# ── queue-aware requoting ────────────────────────────────────────────────────
+
+class TestQueueAwareStrategy:
+    # alpha=1.0 makes fair value equal the instantaneous mid, isolating the
+    # requote logic from EWMA lag
+    PARAMS = dict(gamma=0.001, sigma=0.05, k=1.5, T=100.0, alpha=1.0)
+
+    def _apply(self, book, actions, ts=0.0):
+        for a in actions:
+            if isinstance(a, SubmitLimit):
+                book.submit_limit(a.side, a.price_ticks, a.qty, a.order_id, ts)
+            elif isinstance(a, Cancel):
+                book.cancel(a.order_id, ts)
+
+    def test_no_actions_when_nothing_moves(self):
+        book = flat_book(mid=1000, spread=4)
+        s = QueueAwareFairValueAvellanedaStoikov(queue_patience=0, **self.PARAMS)
+        self._apply(book, s.on_book_update(book, ts=0.0))
+        assert s.on_book_update(book, ts=0.001) == []
+
+    # For book-movement tests the strategy must quote far from the BBO so
+    # that its own resting orders don't set the mid: δ clamps at
+    # max_half_spread=50 → quotes at mid∓50, flow orders control the BBO.
+    WIDE = dict(gamma=0.1, sigma=2.0, k=1.5, T=1000.0, alpha=1.0)
+
+    def test_move_within_patience_keeps_quotes(self):
+        """A 1-tick shift in both desired prices is tolerated at patience=2."""
+        book = flat_book(mid=1000, spread=4)   # bid 998 / ask 1002
+        s = QueueAwareFairValueAvellanedaStoikov(queue_patience=2, **self.WIDE)
+        self._apply(book, s.on_book_update(book, ts=0.0))   # quotes 950/1050
+        # Shift the whole book up 1 tick: mid 1000 → 1001
+        book.cancel(1, ts=0.5)
+        book.cancel(2, ts=0.5)
+        book.submit_limit(Side.BID, 999, 100, 901, 0.5)
+        book.submit_limit(Side.ASK, 1003, 100, 902, 0.5)
+        assert s.on_book_update(book, ts=0.0) == []
+
+    def test_same_move_requotes_at_zero_patience(self):
+        book = flat_book(mid=1000, spread=4)
+        s = QueueAwareFairValueAvellanedaStoikov(queue_patience=0, **self.WIDE)
+        self._apply(book, s.on_book_update(book, ts=0.0))
+        book.cancel(1, ts=0.5)
+        book.cancel(2, ts=0.5)
+        book.submit_limit(Side.BID, 999, 100, 901, 0.5)
+        book.submit_limit(Side.ASK, 1003, 100, 902, 0.5)
+        actions = s.on_book_update(book, ts=0.0)
+        assert len([a for a in actions if isinstance(a, Cancel)]) == 2
+        assert len([a for a in actions if isinstance(a, SubmitLimit)]) == 2
+
+    def test_only_moved_side_requotes(self):
+        """When rounding shifts only the desired ask, the resting bid keeps
+        its queue position."""
+        book = flat_book(mid=1000, spread=4)   # bid 998 / ask 1002
+        s = QueueAwareFairValueAvellanedaStoikov(queue_patience=0, **self.WIDE)
+        self._apply(book, s.on_book_update(book, ts=0.0))   # quotes 950/1050
+        bid_id_before = s._bid_id
+        # Move only the best bid 998 → 999: mid 1000.5.  Desired bid stays
+        # floor(1000.5-50)=950; desired ask moves to ceil(1000.5+50)=1051.
+        book.cancel(1, ts=0.5)
+        book.submit_limit(Side.BID, 999, 100, 901, 0.5)
+        actions = s.on_book_update(book, ts=0.0)
+        assert s._bid_id == bid_id_before          # bid untouched
+        cancelled = {a.order_id for a in actions if isinstance(a, Cancel)}
+        assert bid_id_before not in cancelled
+        submits = [a for a in actions if isinstance(a, SubmitLimit)]
+        assert len(submits) == 1 and submits[0].side == Side.ASK
+
+    def test_dead_side_resubmitted(self):
+        """A filled quote (cleared id) is replaced on the next update."""
+        book = flat_book(mid=1000, spread=4)
+        s = QueueAwareFairValueAvellanedaStoikov(queue_patience=2, **self.PARAMS)
+        self._apply(book, s.on_book_update(book, ts=0.0))
+        bid_id = s._bid_id
+        book.cancel(bid_id, ts=0.5)                # simulate the fill removing it
+        s.on_fill(order_id=bid_id, side=Side.BID, price_ticks=999, qty=1, ts=0.5)
+        actions = s.on_book_update(book, ts=1.0)
+        submits = [a for a in actions if isinstance(a, SubmitLimit)]
+        assert len(submits) == 1 and submits[0].side == Side.BID
 
 
 # ── fair-value anchored variant ──────────────────────────────────────────────

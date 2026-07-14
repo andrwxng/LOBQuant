@@ -79,6 +79,9 @@ class Simulator:
     strategy        : Strategy instance (or None for no strategy)
     duration        : simulation duration in seconds
     snapshot_interval : seconds between full book snapshots (0 = no snapshots)
+    latency         : seconds between a strategy decision and its order
+                      reaching the book (applied to submissions and cancels;
+                      0 = instantaneous, the pre-latency behaviour)
     """
 
     def __init__(
@@ -91,11 +94,13 @@ class Simulator:
         initial_spread: int = 4,
         initial_depth: int = 10,
         initial_qty_per_level: int = 5,
+        latency: float = 0.0,
     ) -> None:
         self.flow = flow
         self.strategy = strategy
         self.duration = duration
         self.snapshot_interval = snapshot_interval
+        self.latency = latency
         self.initial_mid = initial_mid
         self.initial_spread = initial_spread
         self.initial_depth = initial_depth
@@ -217,7 +222,7 @@ class Simulator:
             if self.strategy is not None and not isinstance(event, (SubmitLimit, Cancel)):
                 actions = self.strategy.on_book_update(book, current_ts)
                 for action in actions:
-                    action_ts = current_ts + EPSILON
+                    action_ts = current_ts + self.latency + EPSILON
                     if isinstance(action, SubmitLimit):
                         action.timestamp = action_ts
                     elif isinstance(action, Cancel):

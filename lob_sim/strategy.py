@@ -151,8 +151,18 @@ class AvellanedaStoikov(Strategy):
         self._last_ask_ticks: Optional[int] = None
         self._last_mid: Optional[float] = None
 
-        # Current live orders: oid -> (side, price)
+        # Every order we have submitted: oid -> (side, price).  Entries are
+        # kept after fills and cancels — under latency a fill can land while
+        # our cancel is still in flight, and it must still be recognised as
+        # ours.  IDs are never reused within a run, so stale entries are
+        # harmless.
         self._our_orders: Dict[int, Tuple[Side, int]] = {}
+        # Orders we have issued a cancel for (may not have landed yet)
+        self._cancel_sent: set = set()
+        # Orders superseded while still in flight (submission not yet landed
+        # at requote time): once they land they must be cancelled.  Kept
+        # small so the GC pass is O(|stale|), not O(all orders ever).
+        self._maybe_stale: set = set()
         # Every order ever submitted this session (for fill-rate / adverse-sel analysis)
         self.all_submitted_ids: set = set()
         self.n_quotes_submitted: int = 0
@@ -206,7 +216,10 @@ class AvellanedaStoikov(Strategy):
         # accidentally become the BBO when the book thins.
         r = max(fair - self.max_half_spread, min(fair + self.max_half_spread, r))
 
-        delta = max(self.min_spread,
+        # Fee-floored: the half-spread must at least cover the per-side
+        # maker fee, or every round trip locks in a loss.  (A rebate —
+        # negative maker_fee — never tightens the floor below min_spread.)
+        delta = max(self.min_spread, self.maker_fee,
                     min(self.half_spread(ts), self.max_half_spread))
 
         raw_bid = r - delta
@@ -227,6 +240,22 @@ class AvellanedaStoikov(Strategy):
 
     # ── Strategy interface ───────────────────────────────────────────────────
 
+    def _collect_stale(self, book: LOBBook, ts: float) -> List[Action]:
+        """
+        Cancel superseded quotes that have landed in the book since being
+        replaced.  Exact for order_size=1; with larger sizes a partially
+        filled superseded remnant may rest until filled or swept.
+        """
+        actions: List[Action] = []
+        for oid in list(self._maybe_stale):
+            if oid in self._cancel_sent:
+                self._maybe_stale.discard(oid)
+            elif book.has_order(oid):
+                actions.append(Cancel(order_id=oid, timestamp=ts))
+                self._cancel_sent.add(oid)
+                self._maybe_stale.discard(oid)
+        return actions
+
     def on_book_update(self, book: LOBBook, ts: float) -> List[Action]:
         if self._t0 is None:
             self._t0 = ts
@@ -240,6 +269,11 @@ class AvellanedaStoikov(Strategy):
         if bid_ticks is None or ask_ticks is None:
             return actions
 
+        # Garbage-collect superseded quotes that have since landed.  Only
+        # populated when submissions were in flight during a requote
+        # (latency > 0); a no-op at zero latency.
+        actions.extend(self._collect_stale(book, ts))
+
         # Determine if we need to requote
         mid_moved = (self._last_mid is None or
                      abs(mid - self._last_mid) >= self.tick_size)
@@ -247,17 +281,24 @@ class AvellanedaStoikov(Strategy):
         ask_changed = ask_ticks != self._last_ask_ticks
 
         if not (mid_moved or bid_changed or ask_changed):
-            return actions   # no change needed
+            return actions   # no requote needed (may still carry GC cancels)
 
-        # Cancel existing quotes
-        if self._bid_id is not None and book.has_order(self._bid_id):
-            actions.append(Cancel(order_id=self._bid_id, timestamp=ts))
-            self._our_orders.pop(self._bid_id, None)
+        # Cancel existing quotes; a quote still in flight (not yet landed)
+        # cannot be cancelled yet, so mark it for GC once it lands
+        if self._bid_id is not None:
+            if book.has_order(self._bid_id):
+                actions.append(Cancel(order_id=self._bid_id, timestamp=ts))
+                self._cancel_sent.add(self._bid_id)
+            else:
+                self._maybe_stale.add(self._bid_id)
             self._bid_id = None
 
-        if self._ask_id is not None and book.has_order(self._ask_id):
-            actions.append(Cancel(order_id=self._ask_id, timestamp=ts))
-            self._our_orders.pop(self._ask_id, None)
+        if self._ask_id is not None:
+            if book.has_order(self._ask_id):
+                actions.append(Cancel(order_id=self._ask_id, timestamp=ts))
+                self._cancel_sent.add(self._ask_id)
+            else:
+                self._maybe_stale.add(self._ask_id)
             self._ask_id = None
 
         # Submit new quotes
@@ -316,6 +357,10 @@ class AvellanedaStoikov(Strategy):
 
         self.cash -= (self.maker_fee if maker else self.taker_fee) * qty
 
+        # A filled superseded order no longer needs garbage collection
+        # (exact for order_size=1, where every fill is a full fill)
+        self._maybe_stale.discard(order_id)
+
         # The _our_orders entry is kept even after a fill: a partially filled
         # quote still rests in the book and later fills on it must still be
         # recognised as ours by the simulator.
@@ -356,6 +401,8 @@ class AvellanedaStoikov(Strategy):
         self._last_ask_ticks = None
         self._last_mid = None
         self._our_orders.clear()
+        self._cancel_sent.clear()
+        self._maybe_stale.clear()
         self.all_submitted_ids.clear()
         self.n_quotes_submitted = 0
         self._t0 = ts
@@ -400,6 +447,97 @@ class FairValueAvellanedaStoikov(AvellanedaStoikov):
     def reset(self, ts: float = 0.0) -> None:
         super().reset(ts)
         self._fair = None
+
+
+class QueueAwareFairValueAvellanedaStoikov(FairValueAvellanedaStoikov):
+    """
+    Fair-value variant with queue-position-aware requoting.
+
+    Two changes versus the base requote logic:
+    1. Per-side: only the side whose desired price actually moved is
+       cancelled and re-submitted.  (The base cancels both sides whenever
+       anything changes, forfeiting FIFO queue position on the unchanged
+       side for nothing.)
+    2. Patience: a side is left alone when the desired price is within
+       queue_patience ticks of the resting quote.  Cancel-replace sends the
+       order to the back of the FIFO queue, so a small price improvement is
+       not worth the lost priority (cf. Cont & de Larrard 2013 on the value
+       of queue position).
+
+    queue_patience=0 still keeps unchanged sides in place; larger values
+    trade price accuracy for queue seniority.
+    """
+
+    def __init__(self, queue_patience: int = 1, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.queue_patience = queue_patience
+
+    def on_book_update(self, book: LOBBook, ts: float) -> List[Action]:
+        if self._t0 is None:
+            self._t0 = ts
+
+        actions: List[Action] = []
+        mid = book.mid()
+        if mid is None:
+            return actions
+
+        bid_ticks, ask_ticks = self.compute_quotes(book, ts)
+        if bid_ticks is None or ask_ticks is None:
+            return actions
+
+        # Garbage-collect superseded quotes (same as base class)
+        actions.extend(self._collect_stale(book, ts))
+
+        def needs_requote(current_id: Optional[int],
+                          last_px: Optional[int], new_px: int) -> bool:
+            if current_id is None or not book.has_order(current_id):
+                return True                    # no live quote on this side
+            if last_px is None:
+                return True
+            return abs(new_px - last_px) > self.queue_patience
+
+        if needs_requote(self._bid_id, self._last_bid_ticks, bid_ticks):
+            if self._bid_id is not None:
+                if book.has_order(self._bid_id):
+                    actions.append(Cancel(order_id=self._bid_id, timestamp=ts))
+                    self._cancel_sent.add(self._bid_id)
+                else:
+                    self._maybe_stale.add(self._bid_id)   # still in flight
+            self._bid_id = None
+            if self.inventory < self.max_inventory:
+                new_bid_id = next(self._id_counter)
+                actions.append(SubmitLimit(
+                    side=Side.BID, price_ticks=bid_ticks,
+                    qty=self.order_size, order_id=new_bid_id, timestamp=ts,
+                ))
+                self._bid_id = new_bid_id
+                self._our_orders[new_bid_id] = (Side.BID, bid_ticks)
+                self.all_submitted_ids.add(new_bid_id)
+                self.n_quotes_submitted += 1
+                self._last_bid_ticks = bid_ticks
+
+        if needs_requote(self._ask_id, self._last_ask_ticks, ask_ticks):
+            if self._ask_id is not None:
+                if book.has_order(self._ask_id):
+                    actions.append(Cancel(order_id=self._ask_id, timestamp=ts))
+                    self._cancel_sent.add(self._ask_id)
+                else:
+                    self._maybe_stale.add(self._ask_id)   # still in flight
+            self._ask_id = None
+            if self.inventory > -self.max_inventory:
+                new_ask_id = next(self._id_counter)
+                actions.append(SubmitLimit(
+                    side=Side.ASK, price_ticks=ask_ticks,
+                    qty=self.order_size, order_id=new_ask_id, timestamp=ts,
+                ))
+                self._ask_id = new_ask_id
+                self._our_orders[new_ask_id] = (Side.ASK, ask_ticks)
+                self.all_submitted_ids.add(new_ask_id)
+                self.n_quotes_submitted += 1
+                self._last_ask_ticks = ask_ticks
+
+        self._last_mid = mid
+        return actions
 
 
 class ImbalanceFairValueAvellanedaStoikov(FairValueAvellanedaStoikov):

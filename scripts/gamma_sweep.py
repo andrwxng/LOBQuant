@@ -32,6 +32,7 @@ from lob_sim import PoissonFlow, Simulator, metrics
 from lob_sim.strategy import (
     AvellanedaStoikov, FairValueAvellanedaStoikov,
     ImbalanceFairValueAvellanedaStoikov,
+    QueueAwareFairValueAvellanedaStoikov,
 )
 
 # Flow / strategy config mirrors the original README sweep so the tables
@@ -65,6 +66,9 @@ TAKER_FEE = 1.0
 IMB_BETAS = [0.5, 1.0, 2.0, 4.0]
 IMB_BASE = dict(alpha=0.005, k=K_CALIBRATED)
 IMB_GAMMA = 0.01
+
+# Queue mode: requote-patience grid on the same base configuration
+QUEUE_PATIENCES = [0, 1, 2, 3]
 
 
 def run_one(
@@ -244,19 +248,69 @@ def sweep_imb() -> None:
     print(f"\ndone in {time.time() - t_start:.1f}s")
 
 
+def sweep_queue() -> None:
+    """Requote-patience grid for queue-aware quoting on the fv config."""
+    t_start = time.time()
+    print(f"Queue-patience search on TRAIN seeds (base: γ={IMB_GAMMA:g}, "
+          f"α={IMB_BASE['alpha']:g}, k={IMB_BASE['k']:g})\n")
+
+    bench = [run_one(IMB_GAMMA, seed, FairValueAvellanedaStoikov, **IMB_BASE)
+             ['final_pnl_ticks'] for seed in TRAIN_SEEDS]
+    best = dict(patience=None, score=_mean(bench) / _std(bench))
+    print(f"  base FV (both-side requote)  pnl={_mean(bench):>7.0f}"
+          f"±{_std(bench):<7.0f} score={best['score']:>6.2f}")
+
+    for patience in QUEUE_PATIENCES:
+        pnls = [run_one(IMB_GAMMA, seed, QueueAwareFairValueAvellanedaStoikov,
+                        queue_patience=patience, **IMB_BASE)['final_pnl_ticks']
+                for seed in TRAIN_SEEDS]
+        mean, std = _mean(pnls), _std(pnls)
+        score = mean / std if std and std > 0 else float('-inf')
+        print(f"  patience={patience}                   pnl={mean:>7.0f}"
+              f"±{std:<7.0f} score={score:>6.2f}")
+        if score > best['score']:
+            best = dict(patience=patience, score=score)
+
+    if best['patience'] is None:
+        print("\nNo patience level beat the base FV strategy on train seeds.")
+        return
+
+    patience = best['patience']
+    print(f"\nSelected on train seeds: patience={patience}")
+    print(f"\nValidation (held-out seeds "
+          f"{VALIDATE_SEEDS[0]}-{VALIDATE_SEEDS[-1]}):\n")
+    val_fv = _row([run_one(IMB_GAMMA, seed, FairValueAvellanedaStoikov,
+                           **IMB_BASE) for seed in VALIDATE_SEEDS])
+    val_q = _row([run_one(IMB_GAMMA, seed, QueueAwareFairValueAvellanedaStoikov,
+                          queue_patience=patience, **IMB_BASE)
+                  for seed in VALIDATE_SEEDS])
+    print("| Strategy | Mean PnL | PnL std | Max DD | Fill rate | Adv sel |")
+    print("|----------|----------|---------|--------|-----------|---------|")
+    for label, r in (("Fair-value AS (both-side requote)", val_fv),
+                     (f"Queue-aware (patience={patience})", val_q)):
+        print(f"| {label} | {r['pnl_mean']:+,.0f} | {r['pnl_std']:,.0f} "
+              f"| {r['max_dd']:,.0f} | {r['fill_rate']:.1%} "
+              f"| {r['adv_sel']:+.2f} |")
+    print(f"\ndone in {time.time() - t_start:.1f}s")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--strategy', choices=['as', 'fv', 'imb'], default='as',
+    parser.add_argument('--strategy', choices=['as', 'fv', 'imb', 'queue'],
+                        default='as',
                         help="'as' = baseline γ-sweep, 'fv' = fair-value "
                              "grid search + held-out validation, 'imb' = "
-                             "imbalance-skew β search on the fv config")
+                             "imbalance-skew β search on the fv config, "
+                             "'queue' = requote-patience search")
     args = parser.parse_args()
     if args.strategy == 'as':
         sweep_as()
     elif args.strategy == 'fv':
         sweep_fv()
-    else:
+    elif args.strategy == 'imb':
         sweep_imb()
+    else:
+        sweep_queue()
 
 
 if __name__ == "__main__":
