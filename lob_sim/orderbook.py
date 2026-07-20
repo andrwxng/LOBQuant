@@ -219,6 +219,42 @@ class LOBBook:
             self._assert_invariants()
         return removed
 
+    def reduce_qty(self, order_id: int, delta_qty: int, ts: float) -> bool:
+        """
+        Reduce a resting order's quantity by delta_qty in place, preserving
+        its price-time priority (unlike cancel-then-resubmit, which would
+        send it to the back of the queue).  If delta_qty >= the remaining
+        qty, the order is removed entirely — equivalent to cancel().
+        Returns True if the order was found, False otherwise.
+        """
+        rec = self._orders.get(order_id)
+        if rec is None:
+            return False
+        if delta_qty >= rec.qty:
+            self.cancel(order_id, ts)
+            return True
+
+        rec.qty -= delta_qty
+        if rec.side == Side.BID:
+            level = self._bids.get(-rec.price_ticks)
+        else:
+            level = self._asks.get(rec.price_ticks)
+        if level is None:
+            if self.debug:
+                raise AssertionError(
+                    f"reduce_qty: order {order_id} in _orders but level missing"
+                )
+            return False
+
+        for i, (oid, _qty) in enumerate(level):
+            if oid == order_id:
+                level[i] = (oid, rec.qty)
+                break
+
+        if self.debug:
+            self._assert_invariants()
+        return True
+
     # ── Book state queries ──────────────────────────────────────────────────
 
     def best_bid(self) -> Optional[int]:

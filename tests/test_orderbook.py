@@ -232,6 +232,49 @@ class TestCancellations:
         assert book.best_ask() == 101
 
 
+# ── reduce_qty (partial cancellation) ───────────────────────────────────────────
+
+class TestReduceQty:
+    def test_reduces_remaining_qty(self):
+        book = make_book(debug=True)
+        bid(book, 100, 10, oid=1)
+        result = book.reduce_qty(1, 4, ts=1.0)
+        assert result is True
+        assert book.order_qty(1) == 6
+        assert book.has_order(1)
+
+    def test_preserves_queue_position(self):
+        """Unlike cancel-then-resubmit, reduce_qty must NOT move the order
+        to the back of the FIFO queue."""
+        book = make_book(debug=True)
+        bid(book, 100, 10, oid=1)
+        bid(book, 100, 5, oid=2)
+        book.reduce_qty(1, 4, ts=1.0)   # order 1: 10 -> 6, still first
+        trades = ask(book, 100, 6, oid=3)
+        assert trades[0].passive_order_id == 1   # order 1 still filled first
+        assert trades[0].qty == 6
+        assert book.order_qty(1) is None         # fully consumed
+        assert book.order_qty(2) == 5             # untouched
+
+    def test_delta_exceeding_qty_cancels_order(self):
+        book = make_book(debug=True)
+        bid(book, 100, 5, oid=1)
+        result = book.reduce_qty(1, 100, ts=1.0)
+        assert result is True
+        assert not book.has_order(1)
+        assert book.best_bid() is None
+
+    def test_delta_equal_to_qty_cancels_order(self):
+        book = make_book(debug=True)
+        bid(book, 100, 5, oid=1)
+        book.reduce_qty(1, 5, ts=1.0)
+        assert not book.has_order(1)
+
+    def test_nonexistent_order_returns_false(self):
+        book = make_book()
+        assert book.reduce_qty(999, 1, ts=1.0) is False
+
+
 # ── market orders ─────────────────────────────────────────────────────────────
 
 class TestMarketOrders:

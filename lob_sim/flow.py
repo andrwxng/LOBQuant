@@ -28,9 +28,13 @@ LOBSTERReplay
 Streams events from a LOBSTER-format message file.  LOBSTER provides
 per-stock order book data with microsecond timestamps.
 
-Message file columns (space-separated):
+Message file columns (CSV, no header):
     timestamp, event_type, order_id, size, price, direction
-where direction 1=buy, -1=sell; price is in dollars×10000 (integer cents).
+where price is in 10000ths of a dollar and direction is the side of the
+order the message concerns.  For new-order, cancel, and modify messages
+that is the order's own side.  For execution messages (type 4/5) LOBSTER's
+convention is that `direction` gives the side of the *resting* order being
+hit, so the aggressor is the opposite side — see LOBSTERReplay for detail.
 
 We re-scale timestamps relative to the file start so t=0 corresponds to
 the first event.
@@ -43,13 +47,13 @@ import itertools
 import math
 import random
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
-from .events import CancelRequest, MarketOrder, Order, Side
+from .events import CancelRequest, MarketOrder, ModifyRequest, Order, Side
 from .orderbook import LOBBook
 
 
-Event = Union[Order, MarketOrder, CancelRequest]
+Event = Union[Order, MarketOrder, CancelRequest, ModifyRequest]
 
 # Flow order IDs start here; strategy IDs start at 2_000_000 (strategy.py)
 # and the seeded book uses 1..N.  Counters are per-instance so that fresh
@@ -300,6 +304,17 @@ class PoissonFlow(OrderFlowGenerator):
 
 # ── LOBSTERReplay ─────────────────────────────────────────────────────────────
 
+# Reserved ID range for replayed/synthetic-seed orders, disjoint from the
+# seeded book (1..N), PoissonFlow (FLOW_ID_BASE=1_000_000+), and strategies
+# (2_000_000+).  Raw LOBSTER order IDs are never used directly as internal
+# order IDs — see LOBSTERReplay._new_internal_id.
+LOBSTER_ID_BASE = 3_000_000
+
+# LOBSTER marks an absent price level with ±9999999999; anything at or
+# beyond this magnitude is treated as "no level" rather than a real price.
+_LOBSTER_EMPTY_LEVEL_SENTINEL = 9_999_999_999
+
+
 class LOBSTERReplay(OrderFlowGenerator):
     """
     Replay events from a LOBSTER message file.
@@ -307,39 +322,141 @@ class LOBSTERReplay(OrderFlowGenerator):
     LOBSTER message format (CSV, no header):
         time, type, order_id, size, price, direction
     where:
-        type: 1=new limit, 2=partial cancel, 3=full cancel, 4=exec visible,
-              5=exec hidden, 7=trading halt
+        type: 1=new limit, 2=partial cancel (reduce qty), 3=full cancel
+              (delete), 4=execution against a visible order, 5=execution
+              against a hidden order, 7=trading halt
         price: in 10000ths of a dollar (i.e., multiply by 1e-4 to get dollars)
-        direction: 1=buy, -1=sell
+        direction: for types 1/2/3, the side of the order the message
+                   concerns.  For types 4/5, LOBSTER documents this as the
+                   side of the *resting* (passive) order being executed —
+                   so the incoming aggressor is on the opposite side.  A
+                   direction=1 (buy limit order) execution means a sell
+                   aggressor hit it, and vice versa.
 
-    We map LOBSTER prices to internal ticks by dividing by a configurable
-    tick_size_lobster (default 100, i.e. 1 cent ticks internally).
+    Order identity
+    --------------
+    LOBSTER order IDs are remapped to a reserved internal range
+    (LOBSTER_ID_BASE+) so they cannot collide with the flow, strategy, or
+    seeded-book ID ranges.  A message can reference an order that was
+    already resting before the replay window began (e.g. placed pre-market)
+    and therefore never appeared as a type-1 "new order" message in this
+    file.  Without `orderbook_file`, such messages have no way to resolve
+    to an internal order and are dropped (see `n_unresolved`).  With
+    `orderbook_file`, the first row seeds the book with one synthetic
+    resting order per non-empty price level (aggregate quantity — LOBSTER's
+    orderbook file does not expose individual pre-existing order identity,
+    only per-level totals), and unresolvable messages fall back to the
+    seeded order at their (side, price) instead of being dropped.
+
+    Hidden executions (type 5) match against liquidity with no
+    representation in the visible book.  Replaying them as ordinary market
+    orders would incorrectly consume visible depth, so they are not turned
+    into events; they are recorded in `hidden_trades` instead.
     """
 
     def __init__(
         self,
         message_file: str,
+        orderbook_file: Optional[str] = None,
+        n_levels: int = 10,
         tick_divisor: int = 100,
         time_scale: float = 1.0,
     ) -> None:
         """
         Parameters
         ----------
-        message_file : path to LOBSTER messages CSV
-        tick_divisor : divide raw LOBSTER price by this to get tick integer
-                       (LOBSTER prices are in 10000ths of $, so divisor=100
-                        gives 1-cent ticks)
-        time_scale   : multiply all timestamps by this (e.g. speed up replay)
+        message_file  : path to LOBSTER messages CSV
+        orderbook_file : path to the matching LOBSTER orderbook CSV.  When
+                         given, its first row seeds the book (see class
+                         docstring).  Columns per level: ask_price,
+                         ask_size, bid_price, bid_size, repeated n_levels
+                         times — LOBSTER's standard orderbook-file layout.
+        n_levels      : number of price levels present in orderbook_file
+        tick_divisor  : divide raw LOBSTER price by this to get tick integer
+                        (LOBSTER prices are in 10000ths of $, so divisor=100
+                         gives 1-cent ticks)
+        time_scale    : multiply all timestamps by this (e.g. speed up replay)
+
+        Attributes set after loading
+        -----------------------------
+        hidden_trades : list of (ts, resting_side, price_ticks, qty) for
+                        type-5 hidden executions — not replayed as book
+                        events (see class docstring), exposed here for
+                        anyone computing total traded volume.
+        n_unresolved  : count of type-2/3 messages whose order_id could not
+                        be resolved to an internal order (no orderbook_file,
+                        and the id was never introduced by an earlier
+                        type-1 message in this file) and were dropped.
         """
         self.tick_divisor = tick_divisor
         self.time_scale = time_scale
-        self._id_counter = itertools.count(FLOW_ID_BASE)
+        self._id_counter = itertools.count(LOBSTER_ID_BASE)
+        self._id_map: Dict[int, int] = {}
+        self._level_seed_ids: Dict[Tuple[Side, int], int] = {}
+        self.hidden_trades: List[Tuple[float, Side, int, int]] = []
+        self.n_unresolved = 0
         self._events: List[Tuple[float, Event]] = []
         self._idx = 0
         self._t0: Optional[float] = None
-        self._load(message_file)
 
-    def _load(self, path: str) -> None:
+        if orderbook_file is not None:
+            self._load_seed(orderbook_file, n_levels)
+        self._load_messages(message_file)
+
+    # ── Loading ──────────────────────────────────────────────────────────
+
+    def _new_internal_id(self, raw_id: int) -> int:
+        """Map (or remap, on ID reuse) a raw LOBSTER order_id to an internal
+        id in the reserved range."""
+        iid = next(self._id_counter)
+        self._id_map[raw_id] = iid
+        return iid
+
+    def _resolve_id(self, raw_id: int, side: Side,
+                    price_ticks: int) -> Optional[int]:
+        """Look up the internal id for a raw LOBSTER order_id, falling back
+        to the seeded synthetic order at (side, price) if the raw id was
+        never introduced by a type-1 message in this file."""
+        if raw_id in self._id_map:
+            return self._id_map[raw_id]
+        return self._level_seed_ids.get((side, price_ticks))
+
+    def _load_seed(self, path: str, n_levels: int) -> None:
+        """Seed the book from the first row of a LOBSTER orderbook file: one
+        synthetic resting order per non-empty level, at ts=0.0 (replayed
+        before any message)."""
+        with open(path, newline='') as f:
+            row = next(csv.reader(f), None)
+        if row is None:
+            return
+
+        for i in range(n_levels):
+            base = 4 * i
+            if base + 3 >= len(row):
+                break
+            try:
+                ask_price_raw = int(row[base])
+                ask_size = int(row[base + 1])
+                bid_price_raw = int(row[base + 2])
+                bid_size = int(row[base + 3])
+            except (ValueError, IndexError):
+                continue
+
+            if ask_size > 0 and abs(ask_price_raw) < _LOBSTER_EMPTY_LEVEL_SENTINEL:
+                self._add_seed_level(Side.ASK, ask_price_raw, ask_size)
+            if bid_size > 0 and abs(bid_price_raw) < _LOBSTER_EMPTY_LEVEL_SENTINEL:
+                self._add_seed_level(Side.BID, bid_price_raw, bid_size)
+
+    def _add_seed_level(self, side: Side, price_raw: int, size: int) -> None:
+        price_ticks = max(1, price_raw // self.tick_divisor)
+        iid = next(self._id_counter)
+        self._level_seed_ids[(side, price_ticks)] = iid
+        self._events.append((0.0, Order(
+            order_id=iid, side=side, price_ticks=price_ticks,
+            qty=size, timestamp=0.0,
+        )))
+
+    def _load_messages(self, path: str) -> None:
         with open(path, newline='') as f:
             reader = csv.reader(f)
             for row in reader:
@@ -348,7 +465,7 @@ class LOBSTERReplay(OrderFlowGenerator):
                 try:
                     ts_raw = float(row[0])
                     etype = int(row[1])
-                    oid = int(row[2])
+                    raw_oid = int(row[2])
                     size = int(row[3])
                     price_raw = int(row[4])
                     direction = int(row[5])
@@ -359,31 +476,49 @@ class LOBSTERReplay(OrderFlowGenerator):
                     self._t0 = ts_raw
                 ts = (ts_raw - self._t0) * self.time_scale
 
-                side = Side.BID if direction == 1 else Side.ASK
+                order_side = Side.BID if direction == 1 else Side.ASK
                 price_ticks = max(1, price_raw // self.tick_divisor)
 
                 if etype == 1:
+                    iid = self._new_internal_id(raw_oid)
                     event: Event = Order(
-                        order_id=oid,
-                        side=side,
-                        price_ticks=price_ticks,
-                        qty=size,
-                        timestamp=ts,
+                        order_id=iid, side=order_side,
+                        price_ticks=price_ticks, qty=size, timestamp=ts,
                     )
-                elif etype in (2, 3):
-                    event = CancelRequest(order_id=oid, timestamp=ts)
-                elif etype in (4, 5):
-                    # Execution — treated as market aggressor hitting passive
+                elif etype == 2:
+                    iid = self._resolve_id(raw_oid, order_side, price_ticks)
+                    if iid is None:
+                        self.n_unresolved += 1
+                        continue
+                    event = ModifyRequest(order_id=iid, delta_qty=size,
+                                          timestamp=ts)
+                elif etype == 3:
+                    iid = self._resolve_id(raw_oid, order_side, price_ticks)
+                    if iid is None:
+                        self.n_unresolved += 1
+                        continue
+                    event = CancelRequest(order_id=iid, timestamp=ts)
+                elif etype == 4:
+                    # Visible execution: aggressor is opposite the resting
+                    # order's side.  The aggressor has no raw LOBSTER id
+                    # (the message's order_id names the resting order), so
+                    # it gets a fresh internal id like any synthetic
+                    # aggressor.
                     event = MarketOrder(
                         order_id=next(self._id_counter),
-                        side=side,
-                        qty=size,
-                        timestamp=ts,
+                        side=order_side.opposite(), qty=size, timestamp=ts,
                     )
+                elif etype == 5:
+                    # Hidden execution — see class docstring.
+                    self.hidden_trades.append(
+                        (ts, order_side, price_ticks, size))
+                    continue
                 else:
-                    continue   # skip halt / other types
+                    continue   # skip halt (7) / other types
 
                 self._events.append((ts, event))
+
+    # ── Public interface ────────────────────────────────────────────────────
 
     def peek_next_ts(self, current_ts: float) -> float:
         if self._idx >= len(self._events):

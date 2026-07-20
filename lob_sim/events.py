@@ -64,6 +64,21 @@ class CancelRequest:
 
 
 @dataclass
+class ModifyRequest:
+    """Reduce a resting order's quantity in place (LOBSTER type-2 partial
+    cancellation).  Unlike CancelRequest, the order stays resting with its
+    original price-time priority if any quantity remains."""
+    order_id: int
+    delta_qty: int
+    timestamp: float
+    event_type: EventType = EventType.CANCEL
+
+    def __post_init__(self) -> None:
+        if self.delta_qty <= 0:
+            raise ValueError(f"delta_qty must be positive, got {self.delta_qty}")
+
+
+@dataclass
 class Trade:
     trade_id: int
     aggressor_side: Side

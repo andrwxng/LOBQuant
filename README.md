@@ -9,7 +9,7 @@ A research-quality Python implementation of a price-time priority matching engin
 ```
 lob_sim/
   __init__.py      re-exports public API
-  events.py        dataclasses: Order, MarketOrder, CancelRequest, Trade, BookSnapshot, Action types
+  events.py        dataclasses: Order, MarketOrder, CancelRequest, ModifyRequest, Trade, BookSnapshot, Action types
   orderbook.py     matching engine (LOBBook)
   flow.py          synthetic flow generators: PoissonFlow, LOBSTERReplay
   strategy.py      Strategy ABC + AvellanedaStoikov + fair-value/imbalance variants
@@ -76,7 +76,7 @@ Two generators share the interface `next_event(ts, book) -> Event`:
 - Each call to `_compute_next_ts()` draws the next inter-arrival time from Exp(total_rate) and selects event type proportional to per-type rates.
 - Configurable: λ_lim, λ_mkt, λ_cancel, p_geom, order size range, seed.
 
-**LOBSTERReplay** streams events from a LOBSTER-format CSV message file, rescaling timestamps and mapping LOBSTER integer prices to internal ticks.
+**LOBSTERReplay** streams events from a LOBSTER-format CSV message file, rescaling timestamps and mapping LOBSTER integer prices to internal ticks. Details, including how to validate the engine against real exchange data and calibrate `PoissonFlow` from it, are in [Testing against real data](#testing-against-real-data) below.
 
 ### Strategy (`strategy.py`)
 
@@ -324,6 +324,81 @@ and a lagged anchor systematically valuable. That is the real lesson: a
 market maker's edge is a model of the order flow, not a quoting formula.
 Against real exchange data (LOBSTERReplay) none of these numbers transfer
 without recalibration.
+
+---
+
+## Testing against real data
+
+Three separate things can be tested against real data, and they are not
+equally hard.
+
+**Calibrate the flow model.** Fit `PoissonFlow`'s λ_lim, λ_mkt, λ_cancel,
+p_geom, and σ from real event counts and price returns (see Calibration
+procedure above) and re-run the strategy ladder under realistic parameters.
+No replay needed — this is the cheapest and most statistically clean check,
+and the honest expectation is that it *closes* the edge shown above, since
+that edge was discovered inside this specific synthetic flow model.
+
+**Validate the matching engine.** LOBSTER ships each message file with a
+companion orderbook file recording the true book state after every message.
+Feed the messages through `LOBBook` via `LOBSTERReplay` and diff the
+reconstructed book against that ground truth after every event — percentage
+agreement is a hard correctness metric for the engine against a real
+exchange feed.
+
+**Replay a strategy — with an explicit fill-model assumption.** Historical
+messages describe what happened *without* your strategy in the book. The
+moment a simulated quote would have filled, reality would have diverged,
+since the resting order behind you wouldn't have been hit. There is no
+fully correct fix; the standard approach is a no-market-impact fill model —
+treat a quote as filled when the tape trades through its price, or trades
+at its price after enough volume has printed to exhaust the queue ahead of
+it (`LOBBook.queue_position()` is built for exactly this). State the
+assumption and report results conditional on it, as any serious backtest
+does.
+
+### `LOBSTERReplay` usage
+
+```python
+from lob_sim import LOBSTERReplay, Simulator
+
+flow = LOBSTERReplay(
+    message_file="AMZN_2012-06-21_message.csv",
+    orderbook_file="AMZN_2012-06-21_orderbook.csv",  # seeds pre-existing liquidity
+    n_levels=10,           # levels present in the orderbook file
+    tick_divisor=100,      # LOBSTER prices are in 10000ths of $; 100 -> 1-cent ticks
+)
+# initial_depth=0: LOBSTERReplay seeds the book itself from real prices;
+# Simulator's default synthetic ladder (centred on initial_mid=1000) would
+# otherwise coexist with and immediately cross the real price levels.
+sim = Simulator(flow=flow, strategy=None, duration=23400.0, initial_depth=0)
+result = sim.run()
+```
+
+Notes on what the replay does and does not recover from LOBSTER data:
+
+- **Order identity.** Raw LOBSTER order IDs are remapped to a reserved
+  internal range. A message can reference an order that was already
+  resting before the file starts (e.g. placed pre-market); such orders
+  never appear as a type-1 "new order" message, so they cannot be resolved
+  to an individual internal ID — LOBSTER's orderbook file gives only
+  per-level aggregate quantity, not individual pre-existing order
+  identity. With `orderbook_file` supplied, the first row seeds one
+  synthetic resting order per non-empty level, and unresolvable
+  cancel/modify messages fall back to that level's synthetic order.
+  Without it, such messages are dropped; `flow.n_unresolved` counts them.
+- **Execution direction.** LOBSTER's `direction` field on execution
+  messages (type 4/5) names the side of the *resting* order being hit, not
+  the aggressor — a buy-limit-order execution means a sell aggressor. The
+  aggressor's `MarketOrder.side` is the opposite of `direction`.
+- **Partial cancellations** (type 2) reduce a resting order's quantity in
+  place via `LOBBook.reduce_qty()`, preserving its FIFO queue position —
+  unlike a cancel-and-resubmit, which would send it to the back of the
+  queue.
+- **Hidden executions** (type 5) match against liquidity with no
+  representation in the visible book. Replaying them as ordinary market
+  orders would incorrectly consume visible depth, so they are not turned
+  into book events; they are collected in `flow.hidden_trades` instead.
 
 ---
 

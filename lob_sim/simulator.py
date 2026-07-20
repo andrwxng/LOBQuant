@@ -40,7 +40,7 @@ from typing import List, Optional, Tuple
 
 from .events import (
     BookSnapshot, Cancel, CancelRequest, MarketOrder,
-    Order, Side, SubmitLimit, Trade,
+    ModifyRequest, Order, Side, SubmitLimit, Trade,
 )
 from .flow import OrderFlowGenerator, PoissonFlow
 from .orderbook import LOBBook
@@ -176,6 +176,8 @@ class Simulator:
                 )
             elif isinstance(event, CancelRequest):
                 book.cancel(event.order_id, current_ts)
+            elif isinstance(event, ModifyRequest):
+                book.reduce_qty(event.order_id, event.delta_qty, current_ts)
             elif isinstance(event, SubmitLimit):
                 # Strategy action
                 if not book.has_order(event.order_id):

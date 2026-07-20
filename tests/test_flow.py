@@ -16,8 +16,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from lob_sim.events import CancelRequest, MarketOrder, Order, Side
-from lob_sim.flow import PoissonFlow
+from lob_sim.events import CancelRequest, MarketOrder, ModifyRequest, Order, Side
+from lob_sim.flow import LOBSTER_ID_BASE, LOBSTERReplay, PoissonFlow
 from lob_sim.orderbook import LOBBook
 
 
@@ -217,6 +217,205 @@ class TestOrderIdPartitioning:
         # in the flow range and far below the strategy range (2M)
         assert ids[0] == ids[1]
         assert all(FLOW_ID_BASE <= i < 2_000_000 for i in ids[0])
+
+
+# ── LOBSTERReplay ─────────────────────────────────────────────────────────────
+
+def _write_csv(path, rows) -> str:
+    path.write_text("\n".join(",".join(str(c) for c in row) for row in rows))
+    return str(path)
+
+
+def _apply(book: LOBBook, event):
+    """Mirror simulator.py's event dispatch for a standalone unit test."""
+    if isinstance(event, Order):
+        return book.submit_limit(event.side, event.price_ticks, event.qty,
+                                 event.order_id, event.timestamp)
+    if isinstance(event, MarketOrder):
+        return book.submit_market(event.side, event.qty, event.order_id,
+                                  event.timestamp)
+    if isinstance(event, CancelRequest):
+        book.cancel(event.order_id, event.timestamp)
+        return []
+    if isinstance(event, ModifyRequest):
+        book.reduce_qty(event.order_id, event.delta_qty, event.timestamp)
+        return []
+    raise TypeError(f"unhandled event type: {type(event)}")
+
+
+class TestLOBSTERReplay:
+    """
+    Fixture (tick_divisor=1, so raw price columns equal tick prices):
+
+    Orderbook file (seeds the book, 2 levels):
+        ask1=102/5, bid1=98/5, ask2=103/3, bid2=97/3
+
+    Message file (5 rows, raw order_id 5001 is a genuine new order; raw
+    order_id 98 is never introduced by a type-1 message and must resolve
+    against the seeded level):
+        1) type=1 new     BID id=5001 price=99 qty=10
+        2) type=2 reduce  id=5001 by 4                 -> qty 10 -> 6
+        3) type=3 cancel  id=98 price=98 (pre-existing) -> seeded BID@98 gone
+        4) type=4 exec    id=5001 price=99 qty=6, direction=1 (resting BID)
+                           -> aggressor is ASK, sweeps id=5001 entirely
+        5) type=5 hidden  price=100 qty=2 direction=-1  -> not replayed
+    """
+
+    def _orderbook_rows(self):
+        return [[102, 5, 98, 5, 103, 3, 97, 3]]
+
+    def _message_rows(self):
+        return [
+            [34200.1, 1, 5001, 10, 99, 1],
+            [34200.2, 2, 5001, 4, 99, 1],
+            [34200.3, 3, 98, 5, 98, 1],
+            [34200.4, 4, 5001, 6, 99, 1],
+            [34200.5, 5, 9999, 2, 100, -1],
+        ]
+
+    def _make_replay(self, tmp_path, with_seed=True):
+        msg_path = _write_csv(tmp_path / "messages.csv", self._message_rows())
+        ob_path = None
+        if with_seed:
+            ob_path = _write_csv(tmp_path / "orderbook.csv",
+                                 self._orderbook_rows())
+        return LOBSTERReplay(message_file=msg_path, orderbook_file=ob_path,
+                             n_levels=2, tick_divisor=1)
+
+    def _drain(self, flow):
+        events = []
+        while True:
+            ev = flow.next_event(0.0, None)
+            if ev is None:
+                break
+            events.append(ev)
+        return events
+
+    # ── ID remapping ─────────────────────────────────────────────────────
+
+    def test_all_ids_in_reserved_range(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        events = self._drain(flow)
+        ids = [e.order_id for e in events if hasattr(e, 'order_id')]
+        assert ids, "expected at least one ID-bearing event"
+        assert all(i >= LOBSTER_ID_BASE for i in ids)
+        # None of the internal ids collide with the raw LOBSTER ids used
+        assert 5001 not in ids and 98 not in ids and 9999 not in ids
+
+    def test_id_reused_across_messages_maps_consistently(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        events = self._drain(flow)
+        new_order = next(e for e in events if isinstance(e, Order)
+                         and e.price_ticks == 99)
+        reduce_ev = next(e for e in events if isinstance(e, ModifyRequest))
+        assert reduce_ev.order_id == new_order.order_id
+
+    # ── Seeding and unresolved fallback ─────────────────────────────────
+
+    def test_seed_creates_one_order_per_level(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        assert len(flow._level_seed_ids) == 4
+        assert (Side.ASK, 102) in flow._level_seed_ids
+        assert (Side.BID, 98) in flow._level_seed_ids
+
+    def test_unresolvable_cancel_falls_back_to_seed(self, tmp_path):
+        flow = self._make_replay(tmp_path, with_seed=True)
+        events = self._drain(flow)
+        cancels = [e for e in events if isinstance(e, CancelRequest)]
+        assert len(cancels) == 1
+        assert cancels[0].order_id == flow._level_seed_ids[(Side.BID, 98)]
+        assert flow.n_unresolved == 0
+
+    def test_unresolvable_cancel_dropped_without_seed_file(self, tmp_path):
+        flow = self._make_replay(tmp_path, with_seed=False)
+        events = self._drain(flow)
+        assert not any(isinstance(e, CancelRequest) for e in events)
+        assert flow.n_unresolved == 1
+
+    # ── Execution direction (the aggressor-inversion bug) ────────────────
+
+    def test_visible_execution_aggressor_is_opposite_resting_side(self, tmp_path):
+        """direction=1 means the RESTING order was a buy limit; the
+        aggressor that hit it must be a sell (ASK)."""
+        flow = self._make_replay(tmp_path)
+        events = self._drain(flow)
+        execs = [e for e in events if isinstance(e, MarketOrder)]
+        assert len(execs) == 1
+        assert execs[0].side == Side.ASK
+        assert execs[0].qty == 6
+
+    def test_hidden_execution_not_replayed_as_event(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        events = self._drain(flow)
+        assert len(events) == len([e for e in events
+                                    if isinstance(e, MarketOrder)]) + \
+               len([e for e in events if not isinstance(e, MarketOrder)])
+        # No event carries qty=2 at price 100 (that's the hidden execution)
+        assert not any(getattr(e, 'qty', None) == 2 and
+                       getattr(e, 'price_ticks', None) == 100
+                       for e in events)
+
+    def test_hidden_execution_recorded_separately(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        assert len(flow.hidden_trades) == 1
+        ts, side, price, qty = flow.hidden_trades[0]
+        assert ts == pytest.approx(0.4)
+        assert (side, price, qty) == (Side.ASK, 100, 2)
+
+    # ── End-to-end book reconstruction ────────────────────────────────────
+
+    def test_full_replay_matches_hand_computed_book_state(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        LOBBook.debug = True
+        book = LOBBook()
+        trades_seen = []
+        while True:
+            ev = flow.next_event(0.0, book)
+            if ev is None:
+                break
+            trades_seen.extend(_apply(book, ev))
+
+        # Seed asks untouched: 102(5), 103(3)
+        assert book.best_ask() == 102
+        # Seed bid@98 was cancelled; new bid@99 (qty6) was fully executed;
+        # only the untouched seed bid@97(3) remains
+        assert book.best_bid() == 97
+        assert book.order_qty(flow._level_seed_ids[(Side.BID, 97)]) == 3
+
+        # The type-4 execution produced exactly one trade: ASK aggressor
+        # sweeping the id=5001 order (now internal) at price 99, qty 6
+        assert len(trades_seen) == 1
+        t = trades_seen[0]
+        assert t.aggressor_side == Side.ASK
+        assert t.price_ticks == 99
+        assert t.qty == 6
+
+    # ── Interface basics (peek / reset) ───────────────────────────────────
+
+    def test_peek_next_ts_reflects_head_of_stream(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        first_ts = flow.peek_next_ts(0.0)
+        assert first_ts == 0.0   # first seed order, at ts=0.0
+
+    def test_peek_next_ts_is_inf_when_exhausted(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        self._drain(flow)
+        assert flow.peek_next_ts(0.0) == float('inf')
+
+    def test_reset_replays_from_start(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        first_pass = self._drain(flow)
+        flow.reset()
+        second_pass = self._drain(flow)
+        assert [type(e) for e in first_pass] == [type(e) for e in second_pass]
+        assert [e.order_id for e in first_pass if hasattr(e, 'order_id')] == \
+               [e.order_id for e in second_pass if hasattr(e, 'order_id')]
+
+    def test_timestamps_nondecreasing(self, tmp_path):
+        flow = self._make_replay(tmp_path)
+        events = self._drain(flow)
+        times = [e.timestamp for e in events]
+        assert all(times[i] <= times[i + 1] for i in range(len(times) - 1))
 
 
 # ── generate_sequence ────────────────────────────────────────────────────────
